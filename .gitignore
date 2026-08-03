@@ -1,0 +1,17 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Data & PDF files (keep these local)
+data/
+*.pdf
+
+# Vector stores & cache
+*.chromadb
+*.sqlite3
+__pycache__/
+.pytest_cache/
+
+# Environment variables & keys
+.env
