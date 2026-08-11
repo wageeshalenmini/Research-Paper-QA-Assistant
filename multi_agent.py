@@ -13,13 +13,15 @@ MAX_REVISIONS = 2
  
  
 class State(TypedDict):
-    messages: Annotated[list, add_messages]   # search agent's own scratchpad
+    messages: Annotated[list, add_messages]
     question: str
-    papers: str          # collected search results + abstracts, handed off between agents
+    papers: str
     summary: str
     critique: str
     approved: bool
     revision_count: int
+    citation_score: float        # NEW — 0.0 to 1.0
+    score_history: list  
  
  
 search_llm = ChatOllama(model="llama3.1", temperature=0).bind_tools(ALL_TOOLS)
@@ -95,37 +97,71 @@ def summarizer_node(state: State):
  
 CRITIC_PROMPT = """You are a critic agent fact-checking a research summary against the
 source abstracts it claims to be based on.
- 
+
 Question: {question}
- 
+
 Source paper data:
 {papers}
- 
+
 Draft summary to check:
 {summary}
- 
-Check every claim in the draft summary against the source paper data above. If every claim
-is supported, respond with exactly:
-APPROVED
- 
-If any claim is unsupported, exaggerated, or not actually present in the source data,
-respond with:
-REVISE: <specific feedback on what to fix>"""
+
+Check every claim in the draft summary against the source paper data above.
+
+Then assign a citation quality score between 0.0 and 1.0 based on:
+- 1.0: every claim is directly supported by a specific abstract
+- 0.7-0.9: most claims supported, minor unsupported details
+- 0.4-0.6: some claims supported but notable gaps or exaggerations
+- 0.0-0.3: most claims are unsupported or cannot be verified
+
+Respond in exactly this format:
+SCORE: <number between 0.0 and 1.0>
+VERDICT: APPROVED or REVISE
+FEEDBACK: <specific feedback if REVISE, or 'All claims supported' if APPROVED>"""
  
  
 def critic_node(state: State):
     prompt = CRITIC_PROMPT.format(
-        question=state["question"], papers=state["papers"], summary=state["summary"]
+        question=state["question"],
+        papers=state["papers"],
+        summary=state["summary"]
     )
     response = plain_llm.invoke([HumanMessage(content=prompt)])
     text = response.content.strip()
-    if text.upper().startswith("APPROVED"):
-        return {"approved": True, "critique": ""}
-    feedback = text.split("REVISE:", 1)[-1].strip() if "REVISE:" in text else text
+
+    # parse score
+    score = 0.5  # default if parsing fails
+    for line in text.splitlines():
+        if line.startswith("SCORE:"):
+            try:
+                score = float(line.split("SCORE:")[1].strip())
+                score = max(0.0, min(1.0, score))  # clamp to valid range
+            except ValueError:
+                pass
+
+    # parse verdict
+    approved = "VERDICT: APPROVED" in text
+
+    # parse feedback
+    feedback = ""
+    for line in text.splitlines():
+        if line.startswith("FEEDBACK:"):
+            feedback = line.split("FEEDBACK:")[1].strip()
+
+    # append to score history
+    history = state.get("score_history", [])
+    history.append({
+        "question": state["question"][:60],   # truncate for readability
+        "score": score,
+        "revisions": state.get("revision_count", 0)
+    })
+
     return {
-        "approved": False,
-        "critique": feedback,
-        "revision_count": state.get("revision_count", 0) + 1,
+        "approved": approved,
+        "critique": feedback if not approved else "",
+        "revision_count": state.get("revision_count", 0) + (0 if approved else 1),
+        "citation_score": score,
+        "score_history": history,
     }
  
  
@@ -158,12 +194,15 @@ app = graph.compile()
  
 if __name__ == "__main__":
     print("Multi-agent Research Q&A Assistant. Type 'exit' to quit.\n")
+    score_history = []   # persists across queries in one session
+
     while True:
         question = input("Ask a research question: ").strip()
         if question.lower() in ("exit", "quit"):
             break
         if not question:
             continue
+
         initial_state = {
             "messages": [HumanMessage(content=question)],
             "question": question,
@@ -172,8 +211,34 @@ if __name__ == "__main__":
             "critique": "",
             "approved": False,
             "revision_count": 0,
+            "citation_score": 0.0,
+            "score_history": score_history,   # pass running history in
         }
+
         result = app.invoke(initial_state)
+        score_history = result.get("score_history", [])  # carry forward
+
         print("\n--- Final Answer ---")
         print(result["summary"])
-        print(f"\n(revisions made: {result.get('revision_count', 0)}, approved: {result.get('approved')})\n")
+
+        score = result.get("citation_score", 0.0)
+        approved = result.get("approved", False)
+        revisions = result.get("revision_count", 0)
+
+        # score label for readability
+        if score >= 0.8:
+            label = "Strong"
+        elif score >= 0.5:
+            label = "Moderate"
+        else:
+            label = "Weak"
+
+        print(f"\n Citation Quality : {score:.2f}/1.00 ({label})")
+        print(f" Verdict          : {'Approved' if approved else 'Needs revision'}")
+        print(f" Revisions made   : {revisions}")
+
+        # running average across session
+        if len(score_history) > 1:
+            avg = sum(e["score"] for e in score_history) / len(score_history)
+            print(f" Session average  : {avg:.2f}/1.00 ({len(score_history)} queries)")
+        print()
