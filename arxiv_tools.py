@@ -1,7 +1,7 @@
 import arxiv
 from langchain_core.tools import tool
  
-_client = arxiv.Client()
+_client = arxiv.Client(delay_seconds=0.0)
  
  
 @tool
